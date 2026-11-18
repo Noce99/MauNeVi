@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MauNeVi</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>MauNeVi</h1>
+  <span class="tagline">MAUro NEtworks VIsualizer</span>
+  <span class="spacer"></span>
+  <label id="version-label" hidden>Version <select id="version"></select></label>
+  <button id="fit" title="Fit the whole network (f)" hidden>Fit</button>
+</header>
+<main>
+  <nav id="networks" aria-label="Networks"></nav>
+  <section id="stage">
+    <svg id="canvas" role="img" aria-label="Network architecture diagram"></svg>
+    <div id="status" role="status"></div>
+    <div id="hint" hidden>Scroll to zoom · drag to pan · click a block or an arrow · double-click a block to zoom to it</div>
+  </section>
+  <aside id="detail" aria-live="polite"></aside>
+</main>
+<script src="vendor/elk.bundled.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

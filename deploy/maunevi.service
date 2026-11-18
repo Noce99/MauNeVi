@@ -1,0 +1,33 @@
+# systemd unit for MauNeVi. Copy to /etc/systemd/system/, adjust the three paths
+# (where the repo is built, and where the MaUR-O checkout whose networks/ it
+# serves lives), then:
+#
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now maunevi
+[Unit]
+Description=MauNeVi, the MAUro NEtworks VIsualizer
+After=network.target
+
+[Service]
+Type=simple
+# A dedicated, unprivileged user is plenty: the service only reads files.
+User=maunevi
+Group=maunevi
+WorkingDirectory=/opt/maunevi
+Environment=MAUNEVI_NETWORKS_DIR=/opt/maur-o/networks
+Environment=MAUNEVI_WEB_DIR=/opt/maunevi/web
+# Behind a reverse proxy: listen on the loopback only.
+Environment=MAUNEVI_BIND=127.0.0.1:8765
+# Set when the proxy keeps a path prefix instead of stripping it:
+#Environment=MAUNEVI_BASE_PATH=/maunevi
+ExecStart=/opt/maunevi/target/release/maunevi
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# Brings the checkout of MaUR-O which MauNeVi reads up to date. MauNeVi reads
+# the folder on every request, so there is nothing to restart.
+[Unit]
+Description=Pull the MaUR-O networks MauNeVi shows
+
+[Service]
+Type=oneshot
+User=maunevi
+Group=maunevi
+# --ff-only: never merge, and never touch what is not a plain update.
+ExecStart=/usr/bin/git -C /opt/maur-o pull --ff-only --quiet
