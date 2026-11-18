@@ -1,14 +1,15 @@
 // The viewer: a network's descriptor as a block diagram you can zoom into.
 //
-// model.js decides what there is (the tree, the layout, which blocks are
-// opened at a zoom); this draws it. The SVG is rebuilt on every change of the
-// view, with every coordinate already in screen pixels, so lines and text
-// stay the size they are meant to be at any zoom, and only what is on screen
-// is built.
+// model.js lays the network out once, every block's insides shrunk to fit in
+// the block; this draws it. Zooming scales the drawing, text and all, and
+// fades a block's summary into what it is made of once that is big enough to
+// see. The SVG is rebuilt on every change of the view, in screen pixels, and
+// only what is on screen (and big enough to see) is built.
 
 import {
-  buildTree, layout, decideToggle, toggled, revealed, endpointNode, formatShape,
-  shapeSymbols, concreteShape, formatBytes, formatCount, wrap, shorten, PAD_TOP,
+  buildTree, layout, openness, legibility, maxZoom, endpointNode, formatShape,
+  shapeSymbols, concreteShape, formatBytes, formatCount, wrap, shorten,
+  HEADER, TITLE_PX, LABEL_PX, SUB_PX, SHAPE_PX,
 } from './model.js';
 
 const NS = 'http://www.w3.org/2000/svg';
@@ -20,6 +21,8 @@ const navEl = document.getElementById('networks');
 const versionEl = document.getElementById('version');
 const versionLabel = document.getElementById('version-label');
 const fitButton = document.getElementById('fit');
+const pullButton = document.getElementById('pull');
+const noticeEl = document.getElementById('notice');
 
 const elk = new window.ELK();
 
@@ -29,7 +32,6 @@ const state = {
   descriptor: null,
   tree: null,
   view: { k: 1, tx: 0, ty: 0 },
-  openSet: new Set(), // the blocks which are opened into their children
   selected: null,  // {kind: 'node'|'edge', key}
   symbols: { B: 1, H: 256, W: 256 },
 };
@@ -57,6 +59,7 @@ async function getJson(path) {
 function setStatus(text) { statusEl.textContent = text; }
 
 async function start() {
+  setUpPull();
   try {
     state.index = await getJson('networks');
   } catch (e) {
@@ -71,6 +74,84 @@ async function start() {
     else setStatus('No networks yet. Run `mauro net describe` in MaUR-O and pull.');
   }
 }
+
+// ------------------------------------------------------------------ pull ---
+
+// The button is there only if the service may pull its checkout of MaUR-O.
+async function setUpPull() {
+  try {
+    const source = await getJson('source');
+    if (!source.pull) return;
+    describeSource(source);
+    pullButton.hidden = false;
+  } catch {
+    // No button, then: the rest of the page works the same.
+  }
+}
+
+function describeSource(source) {
+  const date = source.date ? `, ${source.date.slice(0, 10)}` : '';
+  pullButton.title = `Get the latest networks: git pull of MaUR-O's ${source.branch} branch (now at ${source.commit}${date})`;
+}
+
+let noticeTimer = 0;
+function notice(text, failed = false) {
+  noticeEl.textContent = text;
+  noticeEl.classList.toggle('failed', failed);
+  noticeEl.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { noticeEl.hidden = true; }, failed ? 15000 : 7000);
+}
+
+/** "unet 0.3" for every version in `after` which `before` did not have. */
+function newVersions(before, after) {
+  const had = new Set((before ? before.networks : []).flatMap((n) =>
+    n.versions.map((v) => `${n.scope}/${n.name}/${v.version}`)));
+  return after.networks.flatMap((n) => n.versions
+    .filter((v) => !had.has(`${n.scope}/${n.name}/${v.version}`))
+    .map((v) => ({ scope: n.scope, name: n.name, version: v.version })));
+}
+
+pullButton.addEventListener('click', async () => {
+  const label = pullButton.textContent;
+  pullButton.disabled = true;
+  pullButton.textContent = 'Pulling…';
+  try {
+    const response = await fetch(api('pull'), { method: 'POST', cache: 'no-store' });
+    const body = await response.text();
+    if (!response.ok) throw new Error(body || `${response.status}`);
+    const { before, after, changed } = JSON.parse(body);
+    describeSource(after);
+    const old = state.index;
+    state.index = await getJson('networks');
+    const fresh = newVersions(old, state.index);
+    renderNav();
+    if (state.current) renderVersions();
+    if (!changed) {
+      notice(`Already up to date: ${after.branch} at ${after.commit}.`);
+    } else {
+      const what = fresh.length
+        ? `new: ${fresh.map((v) => `${v.name} ${v.version}`).join(', ')}`
+        : 'no new network versions';
+      notice(`Pulled ${after.branch}: ${before.commit} → ${after.commit}, ${what}.`);
+    }
+    // Looking at the latest version of a network which has a newer one now:
+    // show that. Any other version stays as it is.
+    const cur = state.current;
+    const network = cur && state.index.networks.find((n) => n.scope === cur.scope && n.name === cur.name);
+    const wasLatest = cur && old && old.networks.some((n) => n.scope === cur.scope && n.name === cur.name && n.latest === cur.version);
+    if (network && wasLatest && network.latest !== cur.version) open(cur.scope, cur.name, network.latest);
+    else if (!cur && state.index.networks[0]) {
+      const first = state.index.networks[0];
+      open(first.scope, first.name, first.latest);
+    }
+  } catch (e) {
+    notice(`Pull failed: ${e.message}`, true);
+  } finally {
+    pullButton.disabled = false;
+    pullButton.textContent = label;
+  }
+});
 
 async function openFromHash() {
   const [scope, name, version] = decodeURIComponent(location.hash.slice(1)).split('/');
@@ -96,10 +177,9 @@ async function load(scope, name, version) {
     if (ticket !== loading) return;
     const tree = buildTree(descriptor);
     setStatus('Laying out…');
-    const openSet = new Set();
-    await layout(elk, tree.root, measure, openSet);
+    await layout(elk, tree.root, measure);
     if (ticket !== loading) return;
-    Object.assign(state, { current: { scope, name, version }, descriptor, tree, selected: null, openSet });
+    Object.assign(state, { current: { scope, name, version }, descriptor, tree, selected: null });
     setStatus('');
     renderNav();
     renderVersions();
@@ -154,11 +234,11 @@ versionEl.addEventListener('change', () => {
 
 const size = () => svg.getBoundingClientRect();
 
-// The zoom which shows the whole of the root, for the layout as it is now.
+// The zoom which shows the whole network.
 function fitK() {
   const { width, height } = size();
   const root = state.tree.root;
-  return Math.min((width - 220) / root.w, (height - 80) / root.h);
+  return Math.min((width - 140) / root.w, (height - 60) / root.h);
 }
 
 function fit(animate = true) {
@@ -173,9 +253,6 @@ function viewCenter() {
 }
 
 let animation = 0;
-let animating = false;
-// Where the pointer last was, in the canvas's pixels: what a zoom is about.
-let pointer = null;
 function zoomTo(cx, cy, k, animate = true) {
   const { width, height } = size();
   const target = { cx, cy, k };
@@ -184,10 +261,9 @@ function zoomTo(cx, cy, k, animate = true) {
     state.view = { k, tx: width / 2 - cx * k, ty: height / 2 - cy * k };
     schedule();
   };
-  if (!animate) { animating = false; apply(target); return; }
+  if (!animate) { apply(target); return; }
   const from = viewCenter();
   const t0 = performance.now();
-  animating = true;
   const step = (now) => {
     const t = clamp((now - t0) / 380, 0, 1);
     const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
@@ -197,124 +273,33 @@ function zoomTo(cx, cy, k, animate = true) {
       k: from.k * Math.pow(target.k / from.k, e),
     });
     if (t < 1) animation = requestAnimationFrame(step);
-    else animating = false;
   };
   animation = requestAnimationFrame(step);
 }
 
-function zoomNode(node) {
+function zoomBox(x0, y0, x1, y1) {
   const { width, height } = size();
-  const k = Math.min((width * 0.8) / node.w, (height * 0.8) / node.h);
-  zoomTo(node.x + node.w / 2, node.y + node.h / 2, k);
+  const k = Math.min((width * 0.8) / (x1 - x0), (height * 0.8) / (y1 - y0), maxZoom(state.tree));
+  zoomTo((x0 + x1) / 2, (y0 + y1) / 2, k);
+}
+
+const zoomNode = (node) => zoomBox(node.x, node.y, node.x + node.w, node.y + node.h);
+
+// An arrow, with what it joins: the blocks at its ends are in the picture.
+function zoomEdge(edge) {
+  if (!edge.route) return zoomNode(edge.container);
+  const xs = edge.route.map((p) => p.x), ys = edge.route.map((p) => p.y);
+  const pad = 80 * edge.unit;
+  zoomBox(Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad);
 }
 
 function zoomAt(px, py, factor) {
   cancelAnimationFrame(animation);
-  animating = false;
   const v = state.view;
-  const k = clamp(v.k * factor, fitK() * 0.5, 14);
+  const k = clamp(v.k * factor, fitK() * 0.5, Math.max(fitK(), maxZoom(state.tree)));
   const r = k / v.k;
   state.view = { k, tx: px - (px - v.tx) * r, ty: py - (py - v.ty) * r };
   schedule();
-}
-
-// ----------------------------------------------------- opening and closing ---
-
-// The layout changes when a block opens or closes, and with it every
-// coordinate. The view is remapped so that what is under the pointer stays
-// under it: the block there keeps its place, and everything else moves aside.
-// If that block is the very one which opens (or closes) it is the same share
-// of the way across it, and it is as wide on the screen as it was.
-
-/** The deepest shown block under the screen point `p`, and where in it (0..1 each way). */
-function blockAt(p) {
-  const { k, tx, ty } = state.view;
-  const inside = (n) => {
-    const x = n.x * k + tx, y = n.y * k + ty;
-    return p.x >= x && p.x <= x + n.w * k && p.y >= y && p.y <= y + n.h * k;
-  };
-  let node = state.tree.root;
-  for (;;) {
-    const next = node.open ? node.children.find(inside) : null;
-    if (!next) break;
-    node = next;
-  }
-  const x = node.x * k + tx, y = node.y * k + ty;
-  return {
-    node,
-    u: clamp((p.x - x) / (node.w * k), 0, 1),
-    v: clamp((p.y - y) / (node.h * k), 0, 1),
-    screenW: node.w * k,
-  };
-}
-
-let relaying = false;
-async function setOpen(path, open) {
-  relaying = true;
-  try {
-    const target = state.tree.byPath.get(path);
-    const { width, height } = size();
-    const p = pointer || { x: width / 2, y: height / 2 };
-    const old = state.view;
-    const anchor = blockAt(p).node;
-    const rect = (n) => ({ x: n.x, y: n.y, w: n.w, h: n.h });
-    // Where the pointer is within a block, as a share of the way across and down.
-    const share = (r) => ({
-      u: clamp((p.x - (r.x * old.k + old.tx)) / (r.w * old.k), 0, 1),
-      v: clamp((p.y - (r.y * old.k + old.ty)) / (r.h * old.k), 0, 1),
-    });
-    const anchorBefore = rect(anchor), targetBefore = rect(target);
-    const anchorShare = share(anchorBefore), targetShare = share(targetBefore);
-
-    const openSet = toggled(state.openSet, path, open);
-    await layout(elk, state.tree.root, measure, openSet);
-    state.openSet = openSet;
-
-    // Three cases: the pointer was over the block which opens or closes, and
-    // that block keeps the width it had on the screen; or it was over another
-    // block, which keeps its place and its size; or over one inside a block
-    // which has just closed, so the closed block takes its place.
-    let node, at, k;
-    if (anchor !== target && anchor.shown) {
-      node = anchor; at = anchorShare; k = old.k;
-    } else {
-      node = target; at = targetShare; k = (targetBefore.w * old.k) / target.w;
-    }
-    state.view = {
-      k,
-      tx: p.x - (node.x + at.u * node.w) * k,
-      ty: p.y - (node.y + at.v * node.h) * k,
-    };
-  } finally {
-    relaying = false;
-  }
-  schedule();
-}
-
-// Brings a node which is inside closed blocks into being, and the view to it.
-async function reveal(node, zoom = true, openIt = false) {
-  relaying = true;
-  try {
-    const openSet = revealed(state.openSet, node);
-    if (openIt && node.parent && node.children.length) openSet.add(node.path);
-    await layout(elk, state.tree.root, measure, openSet);
-    state.openSet = openSet;
-  } finally {
-    relaying = false;
-  }
-  if (zoom) {
-    const { width, height } = size();
-    const k = Math.min((width * 0.8) / node.w, (height * 0.8) / node.h);
-    zoomTo(node.x + node.w / 2, node.y + node.h / 2, k, false);
-  }
-  schedule();
-}
-
-function maybeToggle() {
-  if (relaying || animating || !state.tree) return;
-  const { width, height } = size();
-  const todo = decideToggle(state.tree.root, state.view, { width, height });
-  if (todo) setOpen(todo.path, todo.open);
 }
 
 // ---------------------------------------------------------------- drawing ---
@@ -334,6 +319,9 @@ function make(tag, attrs = {}, parent = null, text = null) {
   return e;
 }
 
+// Below this many pixels a text is not even built: it could not be read.
+const MIN_TEXT_PX = 4;
+
 function render() {
   if (!state.tree) { svg.replaceChildren(); return; }
   const { width, height } = size();
@@ -341,92 +329,116 @@ function render() {
   const sx = (x) => x * k + tx;
   const sy = (y) => y * k + ty;
   const root = make('g');
-  // Where shape labels already are, so that two do not print over each other.
-  const taken = [];
   const visible = (n) => {
     const x = sx(n.x), y = sy(n.y);
     return x < width && y < height && x + n.w * k > 0 && y + n.h * k > 0;
   };
+  const isSelected = (kind, key) => state.selected && state.selected.kind === kind && state.selected.key === key;
 
-  function drawText(parent, node, x, y, w, h) {
-    // Label, id, then the summary as far as it fits.
-    const main = clamp(14 * k, 0, 22);
-    if (main < 8 || w < 28) return;
-    const small = Math.max(main * 0.78, 8);
-    const avail = w - 12;
-    const lines = [];
-    let fontMain = main;
-    const labelW = measure(node.label, main, 600);
-    if (labelW > avail) fontMain = Math.max(8, main * avail / labelW);
-    lines.push({ text: node.label, px: fontMain, cls: 'label' });
-    if (node.id !== node.label && small >= 8) {
-      lines.push({ text: node.id, px: Math.min(small, fontMain), cls: 'sub mono' });
+  // One line of text, `px` high on screen, faded as it gets too small to read.
+  function text(parent, str, x, y, px, cls, anchor = 'middle', alpha = 1) {
+    const o = alpha * legibility(px);
+    if (px < MIN_TEXT_PX || o <= 0.02) return;
+    make('text', {
+      x: x.toFixed(1), y: y.toFixed(1), 'text-anchor': anchor, 'font-size': px.toFixed(2), class: cls,
+      opacity: o.toFixed(2), 'pointer-events': 'none',
+    }, parent, str);
+  }
+
+  // Lines centred in a box, as many as fit: [{text, px, cls}].
+  function textBlock(parent, lines, x, y, w, h, alpha = 1) {
+    if (lines[0].px < MIN_TEXT_PX) return;
+    const avail = w - lines[0].px;
+    const shown = [];
+    let used = 0;
+    for (const l of lines) {
+      const lh = l.px * 1.3;
+      if (used + lh > h * 0.92) break;
+      shown.push(l);
+      used += lh;
     }
-    if (node.summary && small >= 8) {
-      const chars = Math.max(6, Math.floor(avail / (small * 0.55)));
+    let cy = y + (h - used) / 2;
+    for (const l of shown) {
+      const fit = Math.floor(avail / (l.px * (l.cls.includes('mono') ? 0.6 : 0.56)));
+      text(parent, l.text.length > fit ? shorten(l.text, Math.max(3, fit)) : l.text,
+        x + w / 2, cy + l.px * 1.0, l.px, l.cls, 'middle', alpha);
+      cy += l.px * 1.3;
+    }
+  }
+
+  function summaryLines(node, u, first) {
+    const lines = first ? [first] : [];
+    const small = SUB_PX * u;
+    if (node.id !== node.label) lines.push({ text: node.id, px: small, cls: 'sub mono' });
+    if (node.summary) {
+      const chars = Math.max(8, Math.floor((node.w * k - small) / (small * 0.55)));
       for (const t of wrap(node.summary, chars, 3)) lines.push({ text: t, px: small, cls: 'sub' });
     }
-    const lineH = (l) => l.px * 1.3;
-    let used = 6;
-    const shown = [];
-    for (const l of lines) {
-      if (used + lineH(l) > h - 2) break;
-      shown.push(l);
-      used += lineH(l);
-    }
-    if (!shown.length) return;
-    let cy = y + (h - (used - 6)) / 2;
-    for (const l of shown) {
-      cy += l.px * 1.05;
-      let text = l.text;
-      const fit = Math.floor(avail / (l.px * (l.cls.includes('mono') ? 0.6 : 0.56)));
-      if (text.length > fit) text = shorten(text, Math.max(3, fit));
-      make('text', {
-        x: x + w / 2, y: cy, 'text-anchor': 'middle', 'font-size': l.px.toFixed(1), class: l.cls,
-        'pointer-events': 'none',
-      }, parent, text);
-      cy += l.px * 0.25;
-    }
+    return lines;
   }
 
   function drawNode(node, parent) {
     if (!visible(node)) return;
     const x = sx(node.x), y = sy(node.y), w = node.w * k, h = node.h * k;
-    const open = node.open;
-    const selected = state.selected && state.selected.kind === 'node' && state.selected.key === node.path;
+    // Pixels per unit in the frame this block is drawn in: every size of it is that times something.
+    const u = node.unit * k;
+    if (w < 1.5 || h < 1.5) return;
+    const selected = isSelected('node', node.path);
     const g = make('g', { 'data-id': node.path }, parent);
     make('title', {}, g, `${node.label} (${node.path})${node.summary ? '\n' + node.summary : ''}`);
-    if (open) {
+    const rx = Math.min(8 * u, 10);
+
+    if (node.children.length === 0) {
+      make('rect', { x, y, width: w, height: h, rx, class: `block k-${node.kind}${selected ? ' selected' : ''}` }, g);
+      textBlock(g, summaryLines(node, u, { text: node.label, px: LABEL_PX * u, cls: 'label' }), x, y, w, h);
+      return;
+    }
+
+    const t = openness(node, k, { width, height });
+    make('rect', {
+      x, y, width: w, height: h, rx, class: `block ${node.parent ? `k-${node.kind}` : 'root'}${selected ? ' selected' : ''}`,
+    }, g);
+    const head = HEADER * u;
+    const titlePx = TITLE_PX * u;
+    const titleFits = Math.floor((w - 20 * u) / (titlePx * 0.58));
+    text(g, shorten(node.label, Math.max(4, titleFits)), x + 10 * u, y + head * 0.5 + titlePx * 0.36, titlePx, 'label', 'start');
+
+    const bodyY = y + head, bodyH = h - head;
+    // The summary goes, then what is inside comes: the two are never on top of each other.
+    const summary = 1 - clamp(t / 0.45, 0, 1), insides = clamp((t - 0.4) / 0.6, 0, 1);
+    const lines = summaryLines(node, u, null);
+    if (summary > 0 && lines.length) textBlock(g, lines, x, bodyY, w, bodyH - 4 * u, summary);
+    if (insides > 0) {
+      const inside = make('g', { opacity: insides.toFixed(2) }, g);
+      // Until it has mostly opened, a click on what is inside is a click on the block.
+      if (insides < 0.5) inside.setAttribute('pointer-events', 'none');
+      const pad = 4 * u;
       make('rect', {
-        x, y, width: w, height: h, rx: Math.min(10, 10 * k + 2), class: `frame${selected ? ' selected' : ''}`,
-      }, g);
-      const px = clamp(PAD_TOP * k * 0.42, 9, 18);
-      if (PAD_TOP * k >= 14 && w > 40) {
-        make('text', {
-          x: x + 10, y: y + PAD_TOP * k * 0.5 + px * 0.35, 'font-size': px.toFixed(1), class: 'label',
-          'pointer-events': 'none',
-        }, g, shorten(node.label, Math.max(4, Math.floor((w - 20) / (px * 0.58)))));
-      }
-      for (const child of node.children) drawNode(child, g);
-      drawEdges(node, g);
-      drawPorts(node, g);
-    } else {
-      if (node.children.length > 0) {
-        // A block which holds others is drawn as a stack of them.
-        const off = clamp(5 * k, 2, 6);
-        make('rect', {
-          x: x + off * 2, y: y - off * 2, width: w, height: h, rx: Math.min(8, 8 * k + 1), class: 'stack',
-        }, g);
-        make('rect', {
-          x: x + off, y: y - off, width: w, height: h, rx: Math.min(8, 8 * k + 1), class: 'stack',
-        }, g);
-      }
-      make('rect', {
-        x, y, width: w, height: h, rx: Math.min(8, 8 * k + 1), class: `block k-${node.kind}${selected ? ' selected' : ''}`,
-      }, g);
-      drawText(g, node, x, y, w, h);
+        x: x + pad, y: bodyY, width: w - 2 * pad, height: bodyH - pad, rx: rx * 0.6, class: 'body',
+        'pointer-events': 'none',
+      }, inside);
+      if (node.parent) drawConnectors(node, inside);
+      drawEdges(node, inside);
+      for (const child of node.children) drawNode(child, inside);
+    }
+    if (!node.parent) drawRootPorts(node, g);
+  }
+
+  // From where an arrow reaches a block from outside to where it goes on
+  // inside: the layout puts the two level, so it is a short straight line.
+  function drawConnectors(node, parent) {
+    const width = edgeWidth(node.inner * k);
+    for (const [name, inner] of Object.entries(node.innerPorts)) {
+      const outer = node.ports[name];
+      if (!outer) continue;
+      make('line', {
+        x1: sx(outer.x).toFixed(1), y1: sy(outer.y).toFixed(1), x2: sx(inner.x).toFixed(1), y2: sy(inner.y).toFixed(1),
+        class: 'edge', style: `stroke-width:${width.toFixed(2)}px`, 'pointer-events': 'none',
+      }, parent);
     }
   }
+
+  const edgeWidth = (u) => clamp(1.4 * u, 0.4, 1.8);
 
   function drawEdges(node, parent) {
     for (const edge of node.edges) {
@@ -434,72 +446,51 @@ function render() {
       const pts = edge.route.map((p) => ({ x: sx(p.x), y: sy(p.y) }));
       const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
       if (Math.max(...xs) < 0 || Math.min(...xs) > width || Math.max(...ys) < 0 || Math.min(...ys) > height) continue;
-      const selected = state.selected && state.selected.kind === 'edge' && state.selected.key === edge.key;
+      const u = edge.unit * k;
+      const selected = isSelected('edge', edge.key);
       const g = make('g', { 'data-edge': edge.key, class: 'edgeg' }, parent);
       make('title', {}, g, `${formatShape(edge.shape)}  (${edge.from} → ${edge.to})`);
       // Stop short of the head so the line does not poke through it.
-      const head = clamp(3 + 5 * Math.sqrt(k), 5, 11);
+      const head = clamp(7 * u, 2, 11);
       const last = pts[pts.length - 1], prev = pts[pts.length - 2];
       const len = Math.hypot(last.x - prev.x, last.y - prev.y) || 1;
       const ux = (last.x - prev.x) / len, uy = (last.y - prev.y) / len;
       const lined = pts.slice(0, -1).concat([{ x: last.x - ux * head * 0.8, y: last.y - uy * head * 0.8 }]);
       const d = lined.map((p, i) => `${i ? 'L' : 'M'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-      make('path', { d, class: 'hit' }, g);
-      make('path', { d, class: `edge${selected ? ' selected' : ''}` }, g);
+      const lw = edgeWidth(u) * (selected ? 1.8 : 1);
+      make('path', { d, class: 'hit', style: `stroke-width:${clamp(14 * u, 4, 14).toFixed(1)}px` }, g);
+      make('path', { d, class: `edge${selected ? ' selected' : ''}`, style: `stroke-width:${lw.toFixed(2)}px` }, g);
       const nx = -uy, ny = ux;
       make('polygon', {
         points: [
           [last.x, last.y],
           [last.x - ux * head + nx * head * 0.45, last.y - uy * head + ny * head * 0.45],
           [last.x - ux * head - nx * head * 0.45, last.y - uy * head - ny * head * 0.45],
-        ].map((p) => p.join(',')).join(' '),
+        ].map((p) => p.map((v) => v.toFixed(1)).join(',')).join(' '),
         class: `edge-head${selected ? ' selected' : ''}`,
       }, g);
-      // The shape, on the longest straight run that has the room for it.
-      const text = formatShape(edge.shape);
-      const px = clamp(10 + k * 0.5, 10, 13);
-      const need = text.length * px * 0.62 + 10;
-      let best = null;
-      for (let i = 0; i + 1 < pts.length; i++) {
-        const a = pts[i], b = pts[i + 1];
-        const l = Math.hypot(b.x - a.x, b.y - a.y);
-        if (!best || l > best.l) best = { a, b, l };
-      }
-      if (best && best.l >= need) {
-        const lx = (best.a.x + best.b.x) / 2, ly = (best.a.y + best.b.y) / 2 - 5;
-        const box = { x0: lx - need / 2, x1: lx + need / 2, y0: ly - px, y1: ly + 3 };
-        const clash = taken.some((t) => box.x0 < t.x1 && box.x1 > t.x0 && box.y0 < t.y1 && box.y1 > t.y0);
-        if (!clash) {
-          taken.push(box);
-          make('text', {
-            x: lx, y: ly, 'text-anchor': 'middle',
-            'font-size': px.toFixed(1), class: 'shape', 'pointer-events': 'none',
-          }, g, text);
-        }
-      }
+      // The shape, where the layout made room for it.
+      const px = SHAPE_PX * u;
+      if (!edge.labelAt || px < MIN_TEXT_PX) continue;
+      text(g, formatShape(edge.shape), sx(edge.labelAt.x), sy(edge.labelAt.y) + px * 0.35, px, 'shape');
     }
   }
 
-  function drawPorts(node, parent) {
-    const names = Object.keys(node.ports);
-    for (const name of names) {
-      const p = node.ports[name];
+  // The network's own input and output, named.
+  function drawRootPorts(node, parent) {
+    const u = k;
+    for (const [name, p] of Object.entries(node.ports)) {
       const x = sx(p.x), y = sy(p.y);
-      make('circle', { cx: x, cy: y, r: 3.5, class: 'port', 'pointer-events': 'none' }, parent);
-      if (node.depth === 0) {
-        const inbound = name.startsWith('@in');
-        const label = name === '@in' ? 'input' : name === '@out' ? 'output' : name.slice(name.indexOf(':') + 1);
-        make('text', {
-          x: x + (inbound ? -9 : 9), y: y + 4, 'text-anchor': inbound ? 'end' : 'start', 'font-size': 12,
-          class: 'io', 'pointer-events': 'none',
-        }, parent, label);
-      }
+      make('circle', { cx: x, cy: y, r: clamp(4 * u, 2, 6), class: 'port', 'pointer-events': 'none' }, parent);
+      const inbound = name.startsWith('@in');
+      const label = name === '@in' ? 'input' : name === '@out' ? 'output' : name.slice(name.indexOf(':') + 1);
+      const px = 13 * u;
+      text(parent, label, x + (inbound ? -1 : 1) * 9 * u, y + px * 0.35, px, 'io', inbound ? 'end' : 'start');
     }
   }
 
   drawNode(state.tree.root, root);
   svg.replaceChildren(root);
-  maybeToggle();
 }
 
 // ------------------------------------------------------------ interaction ---
@@ -511,7 +502,6 @@ let pinch = null;
 svg.addEventListener('wheel', (e) => {
   e.preventDefault();
   const r = size();
-  pointer = { x: e.clientX - r.left, y: e.clientY - r.top };
   zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0018)));
 }, { passive: false });
 
@@ -527,8 +517,6 @@ svg.addEventListener('pointerdown', (e) => {
 });
 
 svg.addEventListener('pointermove', (e) => {
-  const r = size();
-  pointer = { x: e.clientX - r.left, y: e.clientY - r.top };
   if (!pointers.has(e.pointerId)) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pinch && pointers.size === 2) {
@@ -700,14 +688,13 @@ function bindDetail() {
     b.addEventListener('click', () => {
       const node = state.tree.byPath.get(b.getAttribute('data-node'));
       select({ kind: 'node', key: node.path });
-      reveal(node);
+      zoomNode(node);
     });
   }
   for (const b of detailEl.querySelectorAll('button[data-edge]')) {
     b.addEventListener('click', () => {
       select({ kind: 'edge', key: b.getAttribute('data-edge') });
-      const edge = state.tree.edges.get(b.getAttribute('data-edge'));
-      reveal(edge.container, true, true);
+      zoomEdge(state.tree.edges.get(b.getAttribute('data-edge')));
     });
   }
   const t = state.selected;

@@ -1,11 +1,24 @@
 # Brings the checkout of MaUR-O which MauNeVi reads up to date. MauNeVi reads
 # the folder on every request, so there is nothing to restart.
+#
+# The checkout is a sparse clone holding only networks/:
+#   git clone --filter=blob:none --sparse https://github.com/Noce99/MaUR-O.git
+#   git -C MaUR-O sparse-checkout set networks
+# It follows whichever branch is checked out there.
 [Unit]
 Description=Pull the MaUR-O networks MauNeVi shows
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=maunevi
-Group=maunevi
+User=enrico
+Group=enrico
 # --ff-only: never merge, and never touch what is not a plain update.
-ExecStart=/usr/bin/git -C /opt/maur-o pull --ff-only --quiet
+ExecStart=/usr/bin/git -C /home/enrico/MaUR-O pull --ff-only --quiet
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/enrico/MaUR-O
+PrivateTmp=yes

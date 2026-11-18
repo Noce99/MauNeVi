@@ -53,6 +53,9 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: 220px 1fr 3
 #canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; user-select: none; }
 #canvas.dragging { cursor: grabbing; }
 #status { position: absolute; left: 16px; top: 12px; color: var(--muted); }
+#notice { position: absolute; right: 16px; top: 12px; max-width: min(520px, calc(100% - 32px)); padding: 6px 12px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 2px 8px rgb(0 0 0 / 8%); white-space: pre-line; }
+#notice.failed { border-color: #d64545; color: #d64545; }
+button:disabled { opacity: .6; cursor: progress; }
 #hint { position: absolute; left: 16px; bottom: 10px; font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--bg) 85%, transparent); padding: 2px 8px; border-radius: 6px; }
 #detail { background: var(--panel); border-left: 1px solid var(--line); overflow: auto; padding: 16px; }
 #detail h2 { margin: 0 0 2px; font-size: 16px; }
@@ -71,8 +74,10 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: 220px 1fr 3
 .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; background: var(--frame); border: 1px solid var(--line); font-size: 12px; }
 
 /* The drawing */
-.frame { fill: var(--frame); stroke: var(--frame-line); stroke-width: 1.2; }
 .block { stroke: var(--frame-line); stroke-width: 1.2; }
+.block.root { fill: var(--frame); }
+/* The inside of a block which shows what it holds. */
+.body { fill: var(--bg); stroke: var(--frame-line); stroke-width: .6; }
 .block.k-conv2d { fill: var(--k-conv); }
 .block.k-batch_norm { fill: var(--k-norm); }
 .block.k-relu, .block.k-tanh, .block.k-affine { fill: var(--k-act); }
@@ -80,19 +85,17 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: 220px 1fr 3
 .block.k-linear { fill: var(--k-linear); }
 .block.k-concat, .block.k-flatten, .block.k-reshape { fill: var(--k-shape); }
 .block.k-double_conv, .block.k-up_block, .block.k-group, .block.k-model { fill: var(--k-block); }
-.stack { fill: var(--panel); stroke: var(--frame-line); stroke-width: 1; }
 .selected { stroke: var(--accent); stroke-width: 2.5; }
+.edge.selected { stroke: var(--accent); }
 .label { fill: var(--ink); font-family: var(--font); font-weight: 600; }
 .sub { fill: var(--muted); font-family: var(--font); }
 .mono { font-family: var(--mono); }
 .edge { fill: none; stroke: var(--edge); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
-.edge.stack { fill: var(--panel); stroke: var(--frame-line); stroke-width: 1; }
-.selected { stroke: var(--accent); stroke-width: 2.5; }
 .edge-head { fill: var(--edge); }
 .edge-head.selected { fill: var(--accent); }
 .hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .edgeg:hover .edge { stroke: var(--accent); }
-.shape { fill: var(--muted); font-family: var(--mono); paint-order: stroke; stroke: var(--bg); stroke-width: 4px; stroke-linejoin: round; }
+.shape { fill: var(--muted); font-family: var(--mono); }
 .port { fill: var(--panel); stroke: var(--edge); stroke-width: 1.5; }
 .io { fill: var(--accent); font-family: var(--font); font-weight: 600; }
 [data-id] { cursor: pointer; }

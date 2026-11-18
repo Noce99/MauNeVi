@@ -1,33 +1,45 @@
-# systemd unit for MauNeVi. Copy to /etc/systemd/system/, adjust the three paths
-# (where the repo is built, and where the MaUR-O checkout whose networks/ it
-# serves lives), then:
-#
-#     sudo systemctl daemon-reload
-#     sudo systemctl enable --now maunevi
+# MauNeVi on noce-server, https://maunevi.nutmade.org. Installed by deploy/install.sh.
+# Elsewhere: change the paths (where the repo is built, and the MaUR-O checkout
+# whose networks/ it serves) and the user.
 [Unit]
 Description=MauNeVi, the MAUro NEtworks VIsualizer
-After=network.target
+Documentation=file:///home/enrico/MauNeVi/README.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=notify-failure@%n.service
 
 [Service]
-Type=simple
-# A dedicated, unprivileged user is plenty: the service only reads files.
-User=maunevi
-Group=maunevi
-WorkingDirectory=/opt/maunevi
-Environment=MAUNEVI_NETWORKS_DIR=/opt/maur-o/networks
-Environment=MAUNEVI_WEB_DIR=/opt/maunevi/web
-# Behind a reverse proxy: listen on the loopback only.
+User=enrico
+Group=enrico
+WorkingDirectory=/home/enrico/MauNeVi
+Environment=MAUNEVI_NETWORKS_DIR=/home/enrico/MaUR-O/networks
+Environment=MAUNEVI_WEB_DIR=/home/enrico/MauNeVi/web
+# Behind Caddy: listen on the loopback only.
 Environment=MAUNEVI_BIND=127.0.0.1:8765
+# The page's "Pull from MaUR-O" button: git pull --ff-only in this checkout
+# (the branch checked out there). Leave it out for no button.
+Environment=MAUNEVI_PULL_REPO=/home/enrico/MaUR-O
 # Set when the proxy keeps a path prefix instead of stripping it:
 #Environment=MAUNEVI_BASE_PATH=/maunevi
-ExecStart=/opt/maunevi/target/release/maunevi
+ExecStart=/usr/local/bin/maunevi
 Restart=on-failure
 RestartSec=2
 
-NoNewPrivileges=true
+# It serves a few JSON files and a static page; a pull runs git, in here too.
+MemoryMax=512M
+
+# Hardening: it reads files, and writes only the MaUR-O checkout, when pulling.
+NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/home/enrico/MaUR-O
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -25,6 +25,9 @@ async fn main() -> std::process::ExitCode {
         config.base_path,
         config.networks_dir.display()
     );
+    if let Some(repo) = &config.pull_repo {
+        eprintln!("maunevi: the page may pull {}", repo.display());
+    }
     let served = axum::serve(listener, router(&config))
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();

@@ -147,227 +147,306 @@ export function endpointNode(edge, role) {
 }
 
 // ---------------------------------------------------------------- layout ---
+//
+// Every node which holds others is laid out once, on its own: its children
+// as blocks, and the edges between them. That picture is then shrunk to fit
+// *inside* the node's own block, below its title, so a block is the same
+// size whether it shows its summary or what it is made of, and the whole
+// network is one fixed drawing. Zooming only scales it (text with it); what
+// changes with the zoom is which blocks show their insides (`openness`).
+//
+// Sizes are in "units": a leaf is about 150 × 58 of them, a title 15 high.
+// Inside a block everything is multiplied by the block's `inner` scale.
 
-const LEAF_MIN_W = 150;
-const LEAF_H = 58;
-const BLOCK_W = 200;
-const BLOCK_H = 78;
-export const PAD_TOP = 40;
-const PAD = 16;
+export const LEAF_MIN_W = 150;
+export const LEAF_H = 58;
+export const HEADER = 26;              // the title strip at the top of a block which holds others
+export const TITLE_PX = 14;            // the size of that title
+export const LABEL_PX = 14;            // the label of a leaf
+export const SUB_PX = 11;              // its id and summary
+export const SHAPE_PX = 10;            // the shape on an arrow
+const BODY_PAD = 8;                    // between a block's border and what it holds
+const BLOCK_AREA = 220 * 110;          // about how big a block which holds others is
+const BLOCK_MIN_W = 180, BLOCK_MAX_W = 340;
+const BODY_MIN_H = 36, BODY_MAX_H = 200;
 
-/** Is this node drawn opened, its children inside it? The root always is. */
-export function isOpenIn(node, openSet) {
-  return node.children.length > 0 && (node.parent === null || openSet.has(node.path));
-}
-
+const elkOptions = {
+  'elk.algorithm': 'layered',
+  'elk.direction': 'RIGHT',
+  'elk.edgeRouting': 'ORTHOGONAL',
+  'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
+  'elk.spacing.nodeNode': '28',
+  'elk.layered.spacing.nodeNodeBetweenLayers': '56',
+  'elk.spacing.edgeNode': '18',
+  'elk.spacing.edgeEdge': '10',
+  'elk.layered.spacing.edgeNodeBetweenLayers': '20',
+  'elk.json.edgeCoords': 'ROOT',
+  'elk.json.shapeCoords': 'PARENT',
+};
 /**
- * The graph for elkjs: one ELK node per descriptor node *which is shown*,
- * ports for every place an edge attaches, and the edges in the node which
- * holds them. A node which is not open is a block of fixed size, whatever it
- * holds, so the layout of the whole is only as big as what is opened.
- * `measure(text, px, weight)` is the width of a text.
+ * The graph for elkjs of what is inside `node`: its children as blocks of
+ * the size `sizes` gives (path -> {w, h}), with ports for every place an edge
+ * attaches, and its edges. The space between columns is enough for the
+ * longest shape written on an arrow. `wrap` breaks a long row into rows.
+ * `pinned` (path -> port name -> {x, y}) fixes where the ports of children
+ * which hold others are: level with where their own insides take the edge on.
  */
-export function toElk(root, measure, openSet = new Set()) {
-  const layoutOptions = {
-    'elk.algorithm': 'layered',
-    'elk.direction': 'RIGHT',
-    'elk.edgeRouting': 'ORTHOGONAL',
-    'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
-    'elk.spacing.nodeNode': '28',
-    'elk.layered.spacing.nodeNodeBetweenLayers': '64',
-    'elk.spacing.edgeNode': '20',
-    'elk.spacing.edgeEdge': '12',
-    'elk.layered.spacing.edgeNodeBetweenLayers': '24',
-    'elk.json.edgeCoords': 'ROOT',
-    'elk.json.shapeCoords': 'PARENT',
-  };
-
-  function build(node) {
-    const elk = { id: node.path, layoutOptions: {}, ports: [], edges: [], children: [] };
-    if (!isOpenIn(node, openSet)) {
-      // A block. Its ports are declared by whoever holds the edges.
-      const container = node.children.length > 0;
-      const text = Math.max(measure(node.label, 14, 600), measure(node.id, 11));
-      elk.width = Math.max(container ? BLOCK_W : LEAF_MIN_W, Math.ceil(text) + 32);
-      elk.height = container ? BLOCK_H : LEAF_H;
-      elk.layoutOptions['elk.portConstraints'] = 'FIXED_SIDE';
-      return elk;
-    }
-    elk.children = node.children.map(build);
-    // Ports of this node itself: the boundary ones its own edges start or end
-    // at. Those of its children are the children's own to declare, so they
-    // are collected here and handed to each child.
-    const own = new Map();
-    const childPorts = new Map(node.children.map((c) => [c, new Map()]));
-    node.edges.forEach((edge) => {
-      const a = endpointPort(edge.from, 'from', node);
-      const b = endpointPort(edge.to, 'to', node);
-      for (const end of [a, b]) {
-        const table = end.owner === node ? own : childPorts.get(end.owner);
-        table.set(end.name, true);
-      }
-      elk.edges.push({
-        id: edge.key,
-        sources: [portId(a.owner, a.name)],
-        targets: [portId(b.owner, b.name)],
-      });
-    });
-    const portList = (table, owner) =>
-      [...table.keys()].sort().map((name) => ({
+export function innerGraph(node, sizes, measure, wrap = false, pinned = new Map()) {
+  const own = new Map();
+  const childPorts = new Map(node.children.map((c) => [c, new Map()]));
+  const edges = node.edges.map((edge) => {
+    const a = endpointPort(edge.from, 'from', node);
+    const b = endpointPort(edge.to, 'to', node);
+    for (const end of [a, b]) (end.owner === node ? own : childPorts.get(end.owner)).set(end.name, true);
+    return {
+      id: edge.key,
+      sources: [portId(a.owner, a.name)],
+      targets: [portId(b.owner, b.name)],
+    };
+  });
+  const longest = Math.max(0, ...node.edges.map((e) => measure(formatShape(e.shape), SHAPE_PX)));
+  const portList = (table, owner) =>
+    [...table.keys()].sort().map((name) => {
+      const at = pinned.get(owner.path) && pinned.get(owner.path)[name];
+      return {
         id: portId(owner, name),
+        width: 0, height: 0,
+        ...(at ? { x: at.x, y: at.y } : {}),
         layoutOptions: { 'elk.port.side': name.startsWith('@in') ? 'WEST' : 'EAST' },
-      }));
-    elk.ports = portList(own, node);
-    for (const child of elk.children) {
-      const owner = node.children.find((c) => c.path === child.id);
-      child.ports = portList(childPorts.get(owner), owner);
-    }
-    Object.assign(elk.layoutOptions, layoutOptions, {
-      'elk.padding': `[top=${PAD_TOP},left=${PAD},bottom=${PAD},right=${PAD}]`,
-      'elk.portConstraints': 'FIXED_SIDE',
+      };
     });
-    return elk;
-  }
-  // The network sits inside an invisible node of its own: elkjs fails on
-  // edges attached to the ports of the very root of the graph it is given,
-  // and the network's input and output are exactly that.
-  return {
-    id: '__world',
-    layoutOptions: { ...layoutOptions },
-    children: [build(root)],
-    edges: [],
+  const constraints = (c) => {
+    const at = pinned.get(c.path);
+    const all = at && [...childPorts.get(c).keys()].every((name) => at[name]);
+    return all ? 'FIXED_POS' : 'FIXED_SIDE';
   };
+  const options = {
+    ...elkOptions,
+    'elk.padding': '[top=12,left=14,bottom=12,right=14]',
+    'elk.portConstraints': 'FIXED_SIDE',
+    'elk.layered.spacing.nodeNodeBetweenLayers': String(Math.max(56, Math.ceil(longest) + 2 * SHAPE_PX)),
+  };
+  if (wrap) {
+    Object.assign(options, {
+      'elk.layered.wrapping.strategy': 'MULTI_EDGE',
+      'elk.aspectRatio': '2.5',
+      'elk.layered.wrapping.multiEdge.improveCuts': 'true',
+      'elk.layered.wrapping.multiEdge.improveWrappedEdges': 'true',
+      'elk.layered.wrapping.additionalEdgeSpacing': '14',
+    });
+  }
+  const box = {
+    id: node.path,
+    layoutOptions: options,
+    ports: portList(own, node),
+    children: node.children.map((c) => ({
+      id: c.path,
+      width: sizes.get(c.path).w,
+      height: sizes.get(c.path).h,
+      ports: portList(childPorts.get(c), c),
+      layoutOptions: { 'elk.portConstraints': constraints(c) },
+    })),
+    edges,
+  };
+  // The node sits inside an invisible one: elkjs fails on edges attached to
+  // the ports of the very root of the graph it is given.
+  return { id: '__world', layoutOptions: { ...elkOptions }, children: [box], edges: [] };
 }
 
-export function shorten(text, max) {
-  return text.length <= max ? text : text.slice(0, max - 1) + '…';
+/** Reads elkjs's answer for `innerGraph(node)` into coordinates relative to the box's corner. */
+function readInner(node, laid) {
+  const box = laid.children[0];
+  const ox = box.x || 0, oy = box.y || 0;
+  const name = (id) => id.slice(id.indexOf('#') + 1);
+  const portsOf = (e, x, y) => Object.fromEntries((e.ports || []).map((p) => [
+    name(p.id), { x: x + (p.x || 0) + (p.width || 0) / 2, y: y + (p.y || 0) + (p.height || 0) / 2 },
+  ]));
+  const children = new Map();
+  for (const c of box.children || []) {
+    children.set(c.id, { x: c.x, y: c.y, w: c.width, h: c.height, ports: portsOf(c, c.x, c.y) });
+  }
+  const routes = new Map();
+  for (const e of box.edges || []) {
+    const s = e.sections && e.sections[0];
+    if (!s) continue;
+    routes.set(e.id, [s.startPoint, ...(s.bendPoints || []), s.endPoint].map((p) => ({ x: p.x - ox, y: p.y - oy })));
+  }
+  return { w: box.width, h: box.height, ports: portsOf(box, 0, 0), children, routes };
 }
 
 /**
- * Reads elkjs's answer back onto the descriptor's nodes and edges. A node
- * which was laid out gets `shown`, `open`, `x, y, w, h` in the root's
- * coordinates and `ports` (name -> {x, y}, the same); one inside a closed
- * block is not `shown` and has no geometry worth reading. An edge of an open
- * node gets `route`, a list of points in the root's coordinates.
+ * Where the shape of each edge is written: just above the middle of its
+ * longest horizontal run, if the text fits along it and lands on no other
+ * label and no block. Edge key -> {x, y}, the middle of the text. All in the
+ * coordinates of the routes.
  */
-export function applyLayout(root, laid) {
-  const elkNodes = new Map();
-  (function index(e) { elkNodes.set(e.id, e); (e.children || []).forEach(index); })(laid);
-  const edgeRoutes = new Map();
-  (function collect(e) {
-    for (const edge of e.edges || []) edgeRoutes.set(edge.id, edge);
-    (e.children || []).forEach(collect);
-  })(laid);
-
-  (function place(node, ox, oy) {
-    const e = elkNodes.get(node.path);
-    node.shown = Boolean(e);
-    node.open = Boolean(e) && (e.children || []).length > 0;
-    for (const edge of node.edges) edge.route = null;
-    if (!e) { node.children.forEach((c) => place(c, 0, 0)); return; }
-    node.x = ox + (e.x || 0);
-    node.y = oy + (e.y || 0);
-    node.w = e.width;
-    node.h = e.height;
-    node.ports = {};
-    for (const p of e.ports || []) {
-      const name = p.id.slice(p.id.indexOf('#') + 1);
-      node.ports[name] = { x: node.x + (p.x || 0) + (p.width || 0) / 2, y: node.y + (p.y || 0) + (p.height || 0) / 2 };
+export function placeLabels(edges, routes, blocks, measure) {
+  const placed = new Map();
+  const taken = [...blocks.values()].map((b) => ({ x0: b.x, y0: b.y, x1: b.x + b.w, y1: b.y + b.h }));
+  for (const edge of edges) {
+    const route = routes.get(edge.key);
+    if (!route) continue;
+    const need = measure(formatShape(edge.shape), SHAPE_PX) + SHAPE_PX;
+    let best = null;
+    for (let i = 0; i + 1 < route.length; i++) {
+      const a = route[i], b = route[i + 1];
+      if (Math.abs(a.y - b.y) > 0.5) continue;
+      const l = Math.abs(b.x - a.x);
+      if (!best || l > best.l) best = { x: (a.x + b.x) / 2, y: a.y, l };
     }
-    for (const child of node.children) place(child, node.x, node.y);
-    if (!node.open) return;
+    if (!best || best.l < need) continue;
+    const at = { x: best.x, y: best.y - SHAPE_PX * 0.75 };
+    const box = { x0: at.x - need / 2, x1: at.x + need / 2, y0: at.y - SHAPE_PX * 0.6, y1: at.y + SHAPE_PX * 0.6 };
+    if (taken.some((t) => box.x0 < t.x1 && box.x1 > t.x0 && box.y0 < t.y1 && box.y1 > t.y0)) continue;
+    taken.push(box);
+    placed.set(edge.key, at);
+  }
+  return placed;
+}
+
+/**
+ * The block a node which holds others is drawn as, for an inside of
+ * `inner.w × inner.h`: about the same area whatever it holds, shaped like it.
+ */
+export function blockSize(inner, titleWidth) {
+  const aspect = inner.w / inner.h;
+  const w = clamp(Math.max(Math.sqrt(BLOCK_AREA * aspect), titleWidth + 28), BLOCK_MIN_W, BLOCK_MAX_W);
+  const body = clamp((w - 2 * BODY_PAD) / aspect + BODY_PAD, BODY_MIN_H, BODY_MAX_H);
+  return { w, h: HEADER + body };
+}
+
+/** How the inside of a block of size `w × h` fits in it: the scale and where its corner goes. */
+export function fitInside(inner, w, h) {
+  const bw = w - 2 * BODY_PAD, bh = h - HEADER - BODY_PAD;
+  const scale = Math.min(bw / inner.w, bh / inner.h);
+  return { scale, dx: (w - inner.w * scale) / 2, dy: HEADER + (bh - inner.h * scale) / 2 };
+}
+
+/**
+ * Lays out the whole tree, every block in its parent, and writes onto every
+ * node `x, y, w, h` (the block, in the root's units), `unit` (how much the
+ * frame it is drawn in is scaled: 1 for the root and its children) and
+ * `ports` (name -> {x, y}, where edges outside it attach). A node which
+ * holds others also gets `inner` (the scale of what is inside it) and
+ * `innerPorts` (where its own edges attach, inside); its edges get `route`,
+ * a list of points, `labelAt`, the middle of where their shape is written,
+ * and `unit`, the scale they are drawn at.
+ * `measure(text, px, weight)` is the width of a text; `elk` an ELK instance.
+ */
+export async function layout(elk, root, measure) {
+  const sizes = new Map();
+  const inners = new Map();
+  const pinned = new Map();
+
+  async function size(node) {
+    if (node.children.length === 0) {
+      const text = Math.max(measure(node.label, LABEL_PX, 600), measure(node.id, SUB_PX));
+      sizes.set(node.path, { w: Math.max(LEAF_MIN_W, Math.ceil(text) + 28), h: LEAF_H });
+      return;
+    }
+    for (const c of node.children) await size(c);
+    let inner = readInner(node, await elk.layout(innerGraph(node, sizes, measure, false, pinned)));
+    const title = measure(node.label, TITLE_PX, 600);
+    // A long chain of layers is a strip many times wider than high, and comes
+    // out tiny in a block: broken into rows it may fill it better. Only for
+    // one way in and one way out (edges to more outputs, like the skips of a
+    // U-Net encoder, would all have to go back across the rows), and only
+    // when much better, rows being harder to follow than a line.
+    const outer = Object.keys(inner.ports);
+    const simple = outer.filter((p) => p.startsWith('@in')).length === 1 && outer.length === 2;
+    if (node.parent && simple && inner.w / inner.h > 4) {
+      const wrapped = readInner(node, await elk.layout(innerGraph(node, sizes, measure, true, pinned)));
+      const scale = (i) => { const b = blockSize(i, title); return fitInside(i, b.w, b.h).scale; };
+      if (scale(wrapped) > 1.25 * scale(inner)) inner = wrapped;
+    }
+    inners.set(node.path, inner);
+    // The root is not a block in anything: it is as big as what it holds.
+    const block = node.parent
+      ? blockSize(inner, title)
+      : { w: Math.max(inner.w + 2 * BODY_PAD, title + 28), h: HEADER + inner.h + BODY_PAD };
+    sizes.set(node.path, block);
+    // An edge reaches the block on its border level with where it goes on inside.
+    const fit = fitInside(inner, block.w, block.h);
+    pinned.set(node.path, Object.fromEntries(Object.entries(inner.ports).map(([name, p]) => [
+      name, { x: name.startsWith('@in') ? 0 : block.w, y: fit.dy + p.y * fit.scale },
+    ])));
+  }
+  await size(root);
+
+  const r = sizes.get(root.path);
+  Object.assign(root, { x: 0, y: 0, w: r.w, h: r.h, unit: 1 });
+  (function place(node) {
+    if (node.children.length === 0) return;
+    const inner = inners.get(node.path);
+    const local = node.w / node.unit, localH = node.h / node.unit;
+    const fit = fitInside(inner, local, localH);
+    const s = node.unit * fit.scale;
+    const ox = node.x + fit.dx * node.unit, oy = node.y + fit.dy * node.unit;
+    const at = (p) => ({ x: ox + p.x * s, y: oy + p.y * s });
+    node.inner = s;
+    node.innerPorts = Object.fromEntries(Object.entries(inner.ports).map(([k, p]) => [k, at(p)]));
+    if (!node.parent) node.ports = node.innerPorts;
+    for (const c of node.children) {
+      const b = inner.children.get(c.path);
+      Object.assign(c, { x: ox + b.x * s, y: oy + b.y * s, w: b.w * s, h: b.h * s, unit: s });
+      c.ports = Object.fromEntries(Object.entries(b.ports).map(([k, p]) => [k, at(p)]));
+      place(c);
+    }
+    const labels = placeLabels(node.edges, inner.routes, inner.children, measure);
     for (const edge of node.edges) {
-      const routed = edgeRoutes.get(edge.key);
-      const section = routed && routed.sections && routed.sections[0];
-      if (!section) continue;
-      edge.route = [section.startPoint, ...(section.bendPoints || []), section.endPoint].map((p) => ({ x: p.x, y: p.y }));
+      const route = inner.routes.get(edge.key);
+      edge.route = route ? route.map(at) : null;
+      edge.labelAt = labels.has(edge.key) ? at(labels.get(edge.key)) : null;
+
+      edge.unit = s;
     }
-  })(root, 0, 0);
-}
-
-/** Runs the whole layout for the nodes in `openSet` opened. `elk` is an `ELK` instance. */
-export async function layout(elk, root, measure, openSet = new Set()) {
-  const graph = toElk(root, measure, openSet);
-  const laid = await elk.layout(graph);
-  applyLayout(root, laid);
+  })(root);
+  if (root.children.length === 0) root.ports = {};
   return root;
-}
-
-/** The paths of every node which has children: what "all open" is. */
-export function allContainers(tree) {
-  return new Set([...tree.byPath.values()].filter((n) => n.children.length > 0).map((n) => n.path));
 }
 
 // ------------------------------------------------- level of detail (zoom) ---
 
 /**
- * How wide a block is on screen when it opens into its children, and how
- * narrow an open node gets before it closes into a block again.
- *
- * Opening is when the children would come out readable, about 70 pixels each,
- * which depends on how many there are: a block of four opens at about 390
- * pixels and one of eight at about 780. Closing is at half of that, and the
- * gap between the two is what keeps a node from opening and closing on the
- * same zoom: opening keeps the node as wide on screen as it was.
+ * How far a block shows what is inside it at zoom `k`, from 0 (its summary)
+ * to 1 (its children). It opens as the children's labels get readable (5 to
+ * 8 pixels), or as the block takes up the view (a third to a half of it,
+ * either way), whichever comes first: a block which fills the screen shows
+ * what it is made of, even if that needs a closer look to read. The root is
+ * always open. `viewport` is {width, height} in pixels.
  */
-export function thresholds(node) {
-  const widths = node.children.map((c) => (c.children.length > 0 ? BLOCK_W : LEAF_MIN_W));
-  const total = widths.reduce((a, b) => a + b, 0) + 64 * Math.max(0, widths.length - 1) + 2 * PAD;
-  const average = widths.length ? widths.reduce((a, b) => a + b, 0) / widths.length : LEAF_MIN_W;
-  const open = clamp(70 * total / average, 340, 900);
-  return { open, close: Math.max(160, open / 2) };
+export function openness(node, k, viewport) {
+  if (node.children.length === 0) return 0;
+  if (!node.parent) return 1;
+  const readable = smoothstep(5, 8, LABEL_PX * node.inner * k);
+  const share = Math.max(node.w * k / viewport.width, node.h * k / viewport.height);
+  return Math.max(readable, smoothstep(0.33, 0.5, share));
+}
+
+/** How visible a text of `px` pixels on screen is: none below 4, all from 6.5. */
+export function legibility(px) {
+  return smoothstep(4, 6.5, px);
+}
+
+/** The zoom which makes the smallest text of the network `px` high: as far as zooming in is useful. */
+export function maxZoom(tree, px = 28) {
+  let unit = 1;
+  for (const n of tree.byPath.values()) unit = Math.min(unit, n.unit);
+  return px / (LABEL_PX * unit);
+}
+
+function smoothstep(a, b, v) {
+  const t = clamp((v - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-/**
- * What, if anything, the view says should open or close next: the outermost
- * open node which is too small (closing comes first), else the biggest block
- * which is big enough for what it holds. Only what is on the screen is asked.
- * Returns `{path, open}` or null. `view` is {k, tx, ty}, `viewport`
- * {width, height}.
- */
-export function decideToggle(root, view, viewport) {
-  const { k, tx, ty } = view;
-  let closing = null;
-  let opening = null;
-  (function walk(n) {
-    if (closing) return;
-    const w = n.w * k;
-    const x = n.x * k + tx;
-    const y = n.y * k + ty;
-    if (x >= viewport.width || y >= viewport.height || x + w <= 0 || y + n.h * k <= 0) return;
-    if (n.open) {
-      if (n.depth > 0 && w < thresholds(n).close) { closing = n; return; }
-      n.children.forEach(walk);
-    } else if (n.children.length > 0) {
-      const over = w / thresholds(n).open;
-      if (over >= 1 && (!opening || over > opening.over)) opening = { n, over };
-    }
-  })(root);
-  if (closing) return { path: closing.path, open: false };
-  if (opening) return { path: opening.n.path, open: true };
-  return null;
-}
-
-/** `openSet` with `path` opened, or closed along with everything under it. */
-export function toggled(openSet, path, open) {
-  const next = new Set(openSet);
-  if (open) { next.add(path); return next; }
-  for (const p of openSet) {
-    if (p === path || p.startsWith(path + SEP)) next.delete(p);
-  }
-  return next;
-}
-
-/** The set which opens every ancestor of `node`: what it takes for it to be shown. */
-export function revealed(openSet, node) {
-  const next = new Set(openSet);
-  for (let p = node.parent; p; p = p.parent) if (p.parent) next.add(p.path);
-  return next;
-}
-
 // ------------------------------------------------------------------ text ---
+
+export function shorten(text, max) {
+  return text.length <= max ? text : text.slice(0, max - 1) + '…';
+}
 
 /** Word wrap of `text` into lines of at most `max` characters, at most `lines` of them. */
 export function wrap(text, max, lines) {

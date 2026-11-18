@@ -50,121 +50,150 @@ test('endpoints resolve to ports', () => {
   assert.throws(() => m.endpointPort('ghost', 'to', n));
 });
 
-function checkLaidOut(tree, expectShown) {
-  const r = tree.root;
-  let shown = 0;
-  for (const node of tree.byPath.values()) {
-    if (!node.shown) continue;
-    shown++;
-    for (const v of [node.x, node.y, node.w, node.h]) assert.ok(Number.isFinite(v), `${node.path}`);
-    assert.ok(node.w > 0 && node.h > 0, node.path);
-    assert.ok(node.x >= r.x - 1 && node.y >= r.y - 1, `${node.path} left of the root`);
-    assert.ok(node.x + node.w <= r.x + r.w + 1 && node.y + node.h <= r.y + r.h + 1, `${node.path} outside the root`);
-    if (node.parent) {
+const inside = (a, b, slack = 0.5) =>
+  a.x >= b.x - slack && a.y >= b.y - slack && a.x + a.w <= b.x + b.w + slack && a.y + a.h <= b.y + b.h + slack;
+const overlap = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+
+async function laidOut(name, version) {
+  const tree = m.buildTree(load('image_to_omap', name, version));
+  await m.layout(new ELK(), tree.root, measure);
+  return tree;
+}
+
+for (const [name, version] of [['tree', '0.1'], ['unet', '0.1'], ['unet', '0.2']]) {
+  test(`${name} ${version}: every block is inside the body of its parent, and none overlap`, async () => {
+    const tree = await laidOut(name, version);
+    assert.ok(tree.byPath.size > 20);
+    for (const node of tree.byPath.values()) {
+      for (const v of [node.x, node.y, node.w, node.h, node.unit]) assert.ok(Number.isFinite(v), node.path);
+      assert.ok(node.w > 0 && node.h > 0, node.path);
+      if (!node.parent) continue;
       const p = node.parent;
-      assert.ok(p.open, `${node.path} is shown inside a node which is not open`);
-      assert.ok(node.x >= p.x - 1 && node.x + node.w <= p.x + p.w + 1, `${node.path} outside its parent`);
-      assert.ok(node.y >= p.y - 1 && node.y + node.h <= p.y + p.h + 1, `${node.path} outside its parent`);
-    }
-    for (const edge of node.edges) {
-      if (!node.open) { assert.equal(edge.route, null, edge.key); continue; }
-      assert.ok(edge.route && edge.route.length >= 2, `edge ${edge.key} has no route`);
-      for (const p of edge.route) {
-        assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), edge.key);
-        // In the root's coordinates, not those of the node holding the edge.
-        assert.ok(p.x >= r.x - 40 && p.x <= r.x + r.w + 40 && p.y >= r.y - 40 && p.y <= r.y + r.h + 40, `${edge.key} at ${p.x},${p.y}`);
+      // Below the parent's title, in the frame its insides are scaled to.
+      const body = { x: p.x, y: p.y + m.HEADER * p.unit, w: p.w, h: p.h - m.HEADER * p.unit };
+      assert.ok(inside(node, body, 0.5 * p.unit), `${node.path} outside the body of ${p.path}`);
+      assert.equal(node.unit, p.inner, node.path);
+      for (const other of p.children) {
+        if (other !== node) assert.ok(!overlap(node, other), `${node.path} overlaps ${other.path}`);
       }
     }
-  }
-  assert.equal(shown, expectShown);
-  // It reads left to right: the root's input is at its left side, its output at its right.
-  const ports = r.ports;
-  assert.ok(ports['@in'], 'the root has an input port');
-  const outs = Object.keys(ports).filter((n) => n.startsWith('@out'));
-  assert.ok(outs.length > 0, 'the root has an output port');
-  for (const name of outs) assert.ok(ports[name].x > ports['@in'].x, name);
-}
-
-for (const [name, version] of [['tree', '0.1'], ['unet', '0.2']]) {
-  test(`${name} ${version} with everything open: every block placed and every edge routed`, async () => {
-    const tree = m.buildTree(load('image_to_omap', name, version));
-    await m.layout(new ELK(), tree.root, measure, m.allContainers(tree));
-    checkLaidOut(tree, tree.byPath.size);
-    assert.ok(tree.byPath.size > 20);
   });
 
-  test(`${name} ${version} with only the root open is a handful of blocks and reads at a glance`, async () => {
-    const tree = m.buildTree(load('image_to_omap', name, version));
-    await m.layout(new ELK(), tree.root, measure);
-    checkLaidOut(tree, 1 + tree.root.children.length);
-    // The far view is readable: blocks no more than a few times wider than high.
-    assert.ok(tree.root.w / tree.root.h < 6, `${tree.root.w} x ${tree.root.h}`);
-    for (const c of tree.root.children) assert.equal(c.open, false);
+  test(`${name} ${version}: every edge is routed within the block which holds it`, async () => {
+    const tree = await laidOut(name, version);
+    for (const edge of tree.edges.values()) {
+      const c = edge.container;
+      assert.ok(edge.route && edge.route.length >= 2, `edge ${edge.key} has no route`);
+      assert.equal(edge.unit, c.inner);
+      for (const p of edge.route) {
+        assert.ok(inside({ ...p, w: 0, h: 0 }, c, 1), `${edge.key} at ${p.x},${p.y} outside ${c.path}`);
+      }
+    }
+  });
+
+  test(`${name} ${version}: an edge reaches a block level with where it goes on inside`, async () => {
+    const tree = await laidOut(name, version);
+    let checked = 0;
+    for (const node of tree.byPath.values()) {
+      if (!node.parent || node.children.length === 0) continue;
+      for (const [port, at] of Object.entries(node.innerPorts)) {
+        const outer = node.ports[port];
+        assert.ok(outer, `${node.path} has no outer ${port}`);
+        assert.ok(Math.abs(outer.y - at.y) < 0.01 * node.h, `${node.path} ${port}: ${outer.y} vs ${at.y}`);
+        // On the border it should be on: inputs left, outputs right.
+        const side = port.startsWith('@in') ? node.x : node.x + node.w;
+        assert.ok(Math.abs(outer.x - side) < 0.01 * node.w, `${node.path} ${port} not on its side`);
+        checked++;
+      }
+    }
+    assert.ok(checked > 10);
+  });
+
+  test(`${name} ${version}: it reads left to right`, async () => {
+    const tree = await laidOut(name, version);
+    const ports = tree.root.ports;
+    assert.ok(ports['@in'], 'the root has an input port');
+    const outs = Object.keys(ports).filter((n) => n.startsWith('@out'));
+    assert.ok(outs.length > 0, 'the root has an output port');
+    for (const out of outs) assert.ok(ports[out].x > ports['@in'].x, out);
   });
 }
 
-test('opening a block lays out what is inside it and nothing deeper', async () => {
-  const tree = m.buildTree(load('image_to_omap', 'tree', '0.1'));
-  const set = m.toggled(new Set(), 'tree_net/encoder', true);
-  await m.layout(new ELK(), tree.root, measure, set);
-  const encoder = tree.byPath.get('tree_net/encoder');
-  assert.equal(encoder.open, true);
-  const down0 = tree.byPath.get('tree_net/encoder/down0');
-  assert.equal(down0.shown, true);
-  assert.equal(down0.open, false);
-  assert.equal(tree.byPath.get('tree_net/encoder/down0/conv1').shown, false);
-  // The block it was is small; open it is wider than its children together.
-  assert.ok(encoder.w > down0.w * 4);
-});
-
-test('a block opens when it is big on screen, an open node closes when it is small, and not both at once', async () => {
-  const tree = m.buildTree(load('image_to_omap', 'tree', '0.1'));
-  await m.layout(new ELK(), tree.root, measure);
-  const vp = { width: 1200, height: 800 };
-  const encoder = tree.byPath.get('tree_net/encoder');
-  const { open: openPx, close: closePx } = m.thresholds(encoder);
-  assert.ok(closePx < openPx);
-  // Centred, at a zoom where the encoder block is just short of its threshold and just past it.
-  const at = (k) => ({ k, tx: 600 - (encoder.x + encoder.w / 2) * k, ty: 400 - (encoder.y + encoder.h / 2) * k });
-  assert.equal(m.decideToggle(tree.root, at((openPx - 5) / encoder.w), vp), null);
-  assert.deepEqual(m.decideToggle(tree.root, at((openPx + 5) / encoder.w), vp), { path: 'tree_net/encoder', open: true });
-
-  // Opened, at the same width on screen: the encoder is not asked to close, and
-  // shrinking it enough does close it.
-  await m.layout(new ELK(), tree.root, measure, m.toggled(new Set(), 'tree_net/encoder', true));
-  const kOpen = (openPx + 5) / encoder.w;
-  const view = (k) => ({ k, tx: 600 - (encoder.x + encoder.w / 2) * k, ty: 400 - (encoder.y + encoder.h / 2) * k });
-  assert.notDeepEqual(m.decideToggle(tree.root, view(kOpen), vp), { path: 'tree_net/encoder', open: false });
-  assert.deepEqual(m.decideToggle(tree.root, view((closePx - 5) / encoder.w), vp), { path: 'tree_net/encoder', open: false });
-});
-
-test('a block with more in it opens later, so that what is inside comes out readable', async () => {
-  const tree = m.buildTree(load('image_to_omap', 'tree', '0.1'));
-  const encoder = tree.byPath.get('tree_net/encoder');            // 8 children
-  const curves = tree.byPath.get('tree_net/curves_head');          // 4 children
-  assert.ok(m.thresholds(encoder).open > m.thresholds(curves).open);
-  for (const n of [encoder, curves]) {
-    const t = m.thresholds(n);
-    assert.ok(t.open >= 340 && t.open <= 900 && t.close >= 160 && t.close < t.open, JSON.stringify(t));
+test('a block which holds others is about the same size whatever it holds, and not a long strip', async () => {
+  for (const [name, version] of [['tree', '0.1'], ['unet', '0.2']]) {
+    const tree = await laidOut(name, version);
+    for (const node of tree.byPath.values()) {
+      if (!node.parent || node.children.length === 0) continue;
+      const w = node.w / node.unit, h = node.h / node.unit;  // in its own frame
+      assert.ok(w >= 180 && w <= 340, `${node.path} is ${w} wide`);
+      assert.ok(w / h < 6, `${node.path} is ${w} x ${h}`);
+      // What it holds is smaller, and fills it one way or the other.
+      const xs = node.children.map((c) => [c.x, c.x + c.w]).flat();
+      const ys = node.children.map((c) => [c.y, c.y + c.h]).flat();
+      const fill = Math.max((Math.max(...xs) - Math.min(...xs)) / node.w, (Math.max(...ys) - Math.min(...ys)) / (node.h - m.HEADER * node.unit));
+      assert.ok(node.inner < node.unit && fill > 0.6, `${node.path}: inner ${node.inner}, fill ${fill}`);
+    }
   }
 });
 
-test('a block off the screen is left as it is', async () => {
-  const tree = m.buildTree(load('image_to_omap', 'tree', '0.1'));
-  await m.layout(new ELK(), tree.root, measure);
-  const k = 5;
-  // Looking at a place well to the right of the whole network.
-  const view = { k, tx: -(tree.root.x + tree.root.w + 500) * k, ty: 0 };
-  assert.equal(m.decideToggle(tree.root, view, { width: 1000, height: 700 }), null);
+test('a block shows its insides as it gets big on screen, and the root always does', async () => {
+  const tree = await laidOut('tree', '0.1');
+  const vp = { width: 1000, height: 700 };
+  const encoder = tree.byPath.get('tree_net/encoder');
+  const leaf = tree.byPath.get('tree_net/encoder/down0/conv1');
+  assert.equal(m.openness(tree.root, 0.01, vp), 1);
+  assert.equal(m.openness(leaf, 100, vp), 0);
+  let last = -1;
+  for (let k = 0.05; k < 200; k *= 1.3) {
+    const t = m.openness(encoder, k, vp);
+    assert.ok(t >= last && t >= 0 && t <= 1, `openness goes back at ${k}`);
+    last = t;
+  }
+  // Small on screen: closed. Filling the view: open, readable or not.
+  assert.equal(m.openness(encoder, 0.5, vp), 0);
+  assert.equal(m.openness(encoder, (vp.width * 0.55) / encoder.w, vp), 1);
+  // Readable children open it even when it is not that big.
+  const leaves = tree.byPath.get('tree_net/leaves_head');
+  const k = 9 / (m.LABEL_PX * leaves.inner);
+  assert.ok(leaves.w * k < vp.width / 3);
+  assert.equal(m.openness(leaves, k, { width: 1e6, height: 1e6 }), 1);
 });
 
-test('toggled closes everything below, and revealed opens every ancestor', async () => {
-  const tree = m.buildTree(load('image_to_omap', 'unet', '0.2'));
-  const open = new Set(['unet/decoder', 'unet/decoder/up0', 'unet/decoder/up0/conv', 'unet/decoder/up1']);
-  assert.deepEqual([...m.toggled(open, 'unet/decoder/up0', false)].sort(), ['unet/decoder', 'unet/decoder/up1']);
-  assert.deepEqual([...m.toggled(open, 'unet/encoder', true)].sort(), ['unet/decoder', 'unet/decoder/up0', 'unet/decoder/up0/conv', 'unet/decoder/up1', 'unet/encoder']);
-  const deep = tree.byPath.get('unet/decoder/up0/conv/conv1');
-  assert.deepEqual([...m.revealed(new Set(), deep)].sort(), ['unet/decoder', 'unet/decoder/up0', 'unet/decoder/up0/conv']);
+test('zooming in goes as far as makes the smallest text big', async () => {
+  const tree = await laidOut('unet', '0.2');
+  const smallest = Math.min(...[...tree.byPath.values()].map((n) => n.unit));
+  assert.ok(Math.abs(m.LABEL_PX * smallest * m.maxZoom(tree) - 28) < 1e-6);
+  assert.ok(smallest < 0.05, 'four levels deep is small');
+});
+
+test('shapes are written on their arrows, over nothing else', async () => {
+  for (const [name, version] of [['tree', '0.1'], ['unet', '0.2']]) {
+    const tree = await laidOut(name, version);
+    let placed = 0;
+    for (const container of tree.byPath.values()) {
+      if (container.children.length === 0) continue;
+      const boxes = [];
+      for (const edge of container.edges) {
+        if (!edge.labelAt) continue;
+        placed++;
+        const u = edge.unit;
+        const w = (measure(m.formatShape(edge.shape), m.SHAPE_PX) + m.SHAPE_PX) * u;
+        const box = { x: edge.labelAt.x - w / 2, y: edge.labelAt.y - m.SHAPE_PX * 0.6 * u, w, h: m.SHAPE_PX * 1.2 * u };
+        // Just above a horizontal run of its own arrow, within it.
+        const onRun = edge.route.some((a, i) => {
+          const b = edge.route[i + 1];
+          return b && Math.abs(a.y - b.y) < 0.01 && Math.abs(edge.labelAt.y + m.SHAPE_PX * 0.75 * u - a.y) < 0.01
+            && box.x >= Math.min(a.x, b.x) - 0.01 && box.x + box.w <= Math.max(a.x, b.x) + 0.01;
+        });
+        assert.ok(onRun, `${edge.key}: label not on its arrow`);
+        for (const b of boxes) assert.ok(!overlap(box, b), `${edge.key}: labels overlap`);
+        for (const c of container.children) assert.ok(!overlap(box, c), `${edge.key}: label over ${c.path}`);
+        boxes.push(box);
+      }
+    }
+    // Most arrows have the room: the layout leaves it between columns.
+    assert.ok(placed > tree.edges.size * 0.6, `${placed} of ${tree.edges.size}`);
+  }
 });
 
 test('wrap breaks at words and caps the lines', () => {
